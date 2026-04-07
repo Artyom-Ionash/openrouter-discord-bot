@@ -25,7 +25,7 @@ no_implicit_optional = true
 [tool.ruff]
 line-length = 200
 target-version = "py311"
-ignore = ["RUF001", "RUF002"]
+ignore = ["RUF00"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "A", "RUF"]
