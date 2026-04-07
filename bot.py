@@ -1,58 +1,64 @@
-import discord
-from openai import AsyncOpenAI
 import os
+
+import discord
 import tiktoken
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletion
 
 load_dotenv()
 
-client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.getenv("OPENROUTER_API_KEY"))
+MAX_TOKENS = 10000
+
+# Инициализация OpenAI клиента
+openai_client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.getenv("OPENROUTER_API_KEY"))
 
 intents = discord.Intents.default()
 intents.message_content = True
 
-custom_status = discord.CustomActivity(name="Исследование")
-bot = discord.Client(intents=intents, activity=custom_status)
+bot = discord.Client(intents=intents, activity=discord.CustomActivity(name="Исследование"))
 
-# Инициализируем кодировщик для нашей модели
-# Для gpt-4o и gpt-4o-mini используется кодировка o200k_base
+# Инициализируем кодировщик
 encoding = tiktoken.get_encoding("o200k_base")
 
+
 @bot.event
-async def on_message(message):
-    if not bot.user:
+async def on_message(message: discord.Message) -> None:
+    """
+    Обработчик сообщений с полной типизацией для Mypy.
+    """
+    # Type Guard: bot.user может быть None, пока бот не залогинился
+    if bot.user is None:
         return
+
+    # Игнорируем свои же сообщения
     if message.author == bot.user:
         return
 
+    # Реакция только на упоминание
     if bot.user.mentioned_in(message):
         current_model = "openai/gpt-4o-mini"
 
-        # Настройки контекста
-        MAX_TOKENS = 10000  # Максимальный размер лога (в токенах), который мы готовы отправить
-
-        user_request = message.content.replace(f'<@{bot.user.id}>', '').replace(f'<@!{bot.user.id}>', '').strip()
+        # Очистка запроса от упоминания
+        user_request = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
         if not user_request:
             user_request = "Проанализируй переписку выше:"
 
-        system_prompt = "Ты — суровый инженер. Обращайся ко мне на ты. Отвечай коротки и по делу, как мужик. Взвешивай плюсы и минусы."
+        system_prompt = "Ты — суровый инженер. Обращайся ко мне на ты. Отвечай коротко и по делу, как мужик. Взвешивай плюсы и минусы."
         base_prompt_text = f"{user_request}\n\n--- КОНТЕКСТ ИЗ ЧАТА ---\n"
 
-        # Считаем, сколько токенов "съедают" системный промпт и запрос пользователя
         base_tokens = len(encoding.encode(system_prompt + base_prompt_text))
         available_tokens_for_log = MAX_TOKENS - base_tokens
 
-        messages_to_process = []
+        messages_to_process: list[str] = []
         current_log_tokens = 0
         message_count = 0
 
-        # Выгребаем историю, пока не заполним доступный лимит токенов
-        # limit=500 означает, что мы проверим максимум 500 последних сообщений
+        # Выгребаем историю
         async for msg in message.channel.history(limit=500, before=message):
             msg_line = f"{msg.author.name}: {msg.content}\n"
             msg_tokens = len(encoding.encode(msg_line))
 
-            # Если следующее сообщение превышает лимит — останавливаем сбор
             if current_log_tokens + msg_tokens > available_tokens_for_log:
                 break
 
@@ -60,40 +66,35 @@ async def on_message(message):
             current_log_tokens += msg_tokens
             message_count += 1
 
-        # Переворачиваем сообщения, чтобы они шли в хронологическом порядке
         messages_to_process.reverse()
         context = "".join(messages_to_process)
         final_prompt = base_prompt_text + context
 
         try:
-            response = await client.chat.completions.create(
+            response: ChatCompletion = await openai_client.chat.completions.create(
                 model=current_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": final_prompt}
+                    {"role": "user", "content": final_prompt},
                 ],
-                # Ограничиваем ВЫХОД модели (например, до 500 токенов)
-                # max_tokens=300,
-                # Можно также добавить температуру для более "инженерных" ответов
-                temperature=0.9
+                temperature=0.9,
             )
 
             usage = response.usage
-            debug_info = f"**[{current_model} | Msgs: {message_count} | Tokens: {usage.prompt_tokens} (in) + {usage.completion_tokens} (out) = {usage.total_tokens}]**"
-            bot_answer = response.choices[0].message.content
+            # Usage может быть None, если API глючит, Mypy требует проверки
+            usage_info = f"Tokens: {usage.prompt_tokens}+{usage.completion_tokens}" if usage else "N/A"
 
-            # Полный текст ответа с подписью
+            debug_info = f"**[{current_model} | Msgs: {message_count} | {usage_info}]**"
+            bot_answer = response.choices[0].message.content or "..."
+
             full_response = f"{debug_info}\n\n{bot_answer}"
 
-            # Проверка лимита Discord (2000 символов)
+            # Разбивка длинных сообщений
             if len(full_response) <= 2000:
                 await message.reply(full_response)
             else:
-                # Если текст длинный, разбиваем его на части
-                # Мы режем по 1900, чтобы оставить запас на форматирование
                 for i in range(0, len(full_response), 1900):
-                    part = full_response[i:i+1900]
-                    # Первую часть отправляем реплаем, остальные — просто в канал
+                    part = full_response[i : i + 1900]
                     if i == 0:
                         await message.reply(part)
                     else:
@@ -102,4 +103,9 @@ async def on_message(message):
         except Exception as e:
             await message.reply(f"**[Error]** Произошла ошибка: {e}")
 
-bot.run(os.getenv("DISCORD_TOKEN"))
+
+if __name__ == "__main__":
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise ValueError("DISCORD_TOKEN не задан")
+    bot.run(token)
