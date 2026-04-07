@@ -11,7 +11,7 @@ load_dotenv()
 MAX_TOKENS = 10000
 
 # Инициализация OpenAI клиента
-openai_client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.getenv("OPENROUTER_API_KEY"))
+client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.getenv("OPENROUTER_API_KEY"))
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -20,6 +20,11 @@ bot = discord.Client(intents=intents, activity=discord.CustomActivity(name="Ис
 
 # Инициализируем кодировщик
 encoding = tiktoken.get_encoding("o200k_base")
+
+
+@bot.event
+async def on_ready() -> None:
+    print(f"{bot.user} на связи.")
 
 
 @bot.event
@@ -71,7 +76,7 @@ async def on_message(message: discord.Message) -> None:
         final_prompt = base_prompt_text + context
 
         try:
-            response: ChatCompletion = await openai_client.chat.completions.create(
+            response: ChatCompletion = await client.chat.completions.create(
                 model=current_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
