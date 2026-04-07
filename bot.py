@@ -1,16 +1,18 @@
 import discord
-from openai import OpenAI
+from openai import AsyncOpenAI
 import os
 import tiktoken
 from dotenv import load_dotenv
 
 load_dotenv()
 
-client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.getenv("OPENROUTER_API_KEY"))
+client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.getenv("OPENROUTER_API_KEY"))
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = discord.Client(intents=intents)
+
+custom_status = discord.CustomActivity(name="Исследование")
+bot = discord.Client(intents=intents, activity=custom_status)
 
 # Инициализируем кодировщик для нашей модели
 # Для gpt-4o и gpt-4o-mini используется кодировка o200k_base
@@ -18,6 +20,8 @@ encoding = tiktoken.get_encoding("o200k_base")
 
 @bot.event
 async def on_message(message):
+    if not bot.user:
+        return
     if message.author == bot.user:
         return
 
@@ -31,7 +35,7 @@ async def on_message(message):
         if not user_request:
             user_request = "Проанализируй переписку выше:"
 
-        system_prompt = "Ты — суровый инженер. Анализируй логи и отвечай на запрос пользователя."
+        system_prompt = "Ты — суровый инженер. Обращайся ко мне на ты. Отвечай коротки и по делу, как мужик. Взвешивай плюсы и минусы."
         base_prompt_text = f"{user_request}\n\n--- КОНТЕКСТ ИЗ ЧАТА ---\n"
 
         # Считаем, сколько токенов "съедают" системный промпт и запрос пользователя
@@ -62,12 +66,16 @@ async def on_message(message):
         final_prompt = base_prompt_text + context
 
         try:
-            response = client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=current_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": final_prompt}
-                ]
+                ],
+                # Ограничиваем ВЫХОД модели (например, до 500 токенов)
+                # max_tokens=300,
+                # Можно также добавить температуру для более "инженерных" ответов
+                temperature=0.9
             )
 
             usage = response.usage
