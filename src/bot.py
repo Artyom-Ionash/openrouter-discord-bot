@@ -3,42 +3,37 @@ import os
 import discord
 import tiktoken
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
-from openai.types.chat import ChatCompletion
+
+from core.discord.guards import is_messageable
+from core.integrations.openrouter import OpenRouterClient
+from core.types.llm import MessageParam
 
 load_dotenv()
 
 MAX_TOKENS = 10000
 
-# 1. СИНХРОННЫЕ РЕСУРСЫ (Безопасно инициализировать глобально)
-# Кодировщик загружается в память 1 раз и не зависит от asyncio.
+# 1. СИНХРОННЫЕ РЕСУРСЫ
 encoding = tiktoken.get_encoding("o200k_base")
 
 
-# 2. АРХИТЕКТУРА КЛИЕНТА (С инкапсуляцией состояния)
+# 2. АРХИТЕКТУРА КЛИЕНТА
 class ElementalBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(intents=intents, activity=discord.CustomActivity(name="Исследование"))
 
-        # Явное объявление зависимости для Mypy.
-        # Будет инициализировано внутри правильного Event Loop.
-        self.llm_client: AsyncOpenAI | None = None
+        # Зависимость теперь ссылается на наш собственный адаптер, а не на чужой SDK
+        self.llm_client: OpenRouterClient | None = None
 
     async def setup_hook(self) -> None:
-        """
-        [LIFECYCLE] Выполняется после создания Event Loop, но до подключения к Gateway.
-        Это единственное безопасное место для создания асинхронных сессий.
-        """
         api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
             raise ValueError("OPENROUTER_API_KEY не задан в окружении")
 
-        self.llm_client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+        self.llm_client = OpenRouterClient(api_key=api_key)
 
 
-# Инициализация каркаса (без запуска сети)
 bot = ElementalBot()
 
 
@@ -54,30 +49,27 @@ async def on_message(message: discord.Message) -> None:
     """
     # --- 1. TYPE GUARDS & EARLY EXITS ---
 
-    # Гарантируем, что бот и LLM клиент готовы
     if bot.user is None or bot.llm_client is None:
         return
 
-    # Защита от петель обратной связи
     if message.author == bot.user:
         return
 
-    # Игнорируем, если не упомянули
     if not bot.user.mentioned_in(message):
         return
 
-    # [КРИСТАЛЛ ТИПИЗАЦИИ]: Сужаем тип канала.
-    # Это аналог `if (!isInstanceOf(channel, Messageable)) return;` из TypeScript.
-    # Снимает красные подчеркивания у `message.channel.history`.
     channel = message.channel
-    # if not isinstance(channel, Messageable):
-    #     return
+
+    # [КРИСТАЛЛ ТИПИЗАЦИИ]: Применяем наш кастомный Type Guard.
+    # Mypy теперь на 100% уверен, что channel имеет тип Messageable,
+    # и больше не будет подчёркивать вызов `.history()` красным.
+    if not is_messageable(channel):
+        return
 
     # --- 2. ПОДГОТОВКА КОНТЕКСТА ---
 
     current_model = "openai/gpt-4o-mini"
 
-    # Очистка запроса
     user_request = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
     if not user_request:
         user_request = "Проанализируй переписку выше:"
@@ -92,11 +84,10 @@ async def on_message(message: discord.Message) -> None:
     current_log_tokens = 0
     message_count = 0
 
-    # Визуальная индикация для пользователя, пока идут тяжелые сетевые запросы
     async with channel.typing():
         # --- 3. ИЗВЛЕЧЕНИЕ ИСТОРИИ ---
 
-        # Mypy теперь знает, что channel - это Messageable, метод history() валиден.
+        # Ошибок типов больше нет.
         async for msg in channel.history(limit=500, before=message):
             msg_line = f"{msg.author.name}: {msg.content}\n"
             msg_tokens = len(encoding.encode(msg_line))
@@ -115,30 +106,32 @@ async def on_message(message: discord.Message) -> None:
         # --- 4. ЗАПРОС К LLM ---
 
         try:
-            response: ChatCompletion = await bot.llm_client.chat.completions.create(
+            # Вызываем наш чистый интерфейс
+            messages: list[MessageParam] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": final_prompt},
+            ]
+
+            response = await bot.llm_client.create_completion(
                 model=current_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": final_prompt},
-                ],
+                messages=messages,
                 temperature=0.9,
             )
 
-            # --- 5. ОБРАБОТКА ОТВЕТА (С ЗАЩИТОЙ ОТ ПУСТЫХ ЗНАЧЕНИЙ) ---
+            # --- 5. ОБРАБОТКА ОТВЕТА ---
 
             usage = response.usage
             usage_info = f"Tokens: {usage.prompt_tokens}+{usage.completion_tokens}" if usage else "N/A"
 
             debug_info = f"**[{current_model} | Msgs: {message_count} | {usage_info}]**"
 
-            # Защита: массив choices может быть пуст, content может быть None.
             bot_answer = "..."
             if response.choices and response.choices[0].message.content:
                 bot_answer = response.choices[0].message.content
 
             full_response = f"{debug_info}\n\n{bot_answer}"
 
-            # --- 6. ДОСТАВКА (С обходом лимитов Discord) ---
+            # --- 6. ДОСТАВКА ---
 
             if len(full_response) <= 2000:
                 await message.reply(full_response)
@@ -151,7 +144,6 @@ async def on_message(message: discord.Message) -> None:
                         await channel.send(part)
 
         except Exception as e:
-            # Защитный фоллбек
             await message.reply(f"**[Error]** Архитектурный сбой: {e}")
 
 
